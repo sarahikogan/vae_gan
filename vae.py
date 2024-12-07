@@ -1,45 +1,51 @@
-print("Starting imports")
+# USE THIS
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset
-from torchvision import transforms, datasets
-import matplotlib.pyplot as plt
-import pandas as pd 
-import numpy as np 
-from torchvision.io import read_image
+from torchvision import transforms
 from PIL import Image
-from datetime import datetime
-from torchvision.transforms import Resize
-from torchvision.transforms.functional import to_pil_image
 import matplotlib.pyplot as plt
-import os
+from datetime import datetime
+import optuna
 
-base_dir = "vae_runs"
+seed = 0
+torch.manual_seed(0)
+
+print("In VAE, running! ")
 
 # timestamped folders for run results
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-run_dir = os.path.join(base_dir, timestamp)
+run_dir = os.path.join("vae_runs", timestamp)
 os.makedirs(run_dir, exist_ok=True)
 
-print("Finished imports")
+# -- SET DEVICE --
+if torch.cuda.is_available(): 
+    device = torch.device("cuda")
+    print("Using GPU!!!")
+else: 
+    device = "cpu"
 
-# load dataset
-class MRIDataset(Dataset): 
-    def __init__(self, root_dir, transform=None, limit=None): 
+img_size = 400
+sys.stdout = open(os.path.join(run_dir, "output.txt"), "w") # redirect prints to file if running in Turing
+
+# -- DEFINE MRI DATA --
+class MRIDataset(Dataset):
+    def __init__(self, root_dir, transform=None, limit=None):
         self.root_dir = root_dir
         self.image_paths = []
-        for subdir in ['Mild Dementia']: # 'Moderate Dementia', 'Non Demented', 'Very mild Dementia']: # can choose just one of these to make it train quicker / on less data, i've been testing on only mild dementia
+        for subdir in ['Mild Dementia']: # TODO switch to all patients - learn representations from all stages of dementia
             subdir_path = os.path.join(root_dir, subdir)
             self.image_paths += [os.path.join(subdir_path, f) for f in os.listdir(subdir_path)]
-        if limit: 
-            self.image_paths = self.image_paths[:limit]  # limit images to train faster
-        self.transform = transform 
+        if limit:
+            self.image_paths = self.image_paths[:limit]  # if neccesary, set limit on training to run model faster
+        self.transform = transform
 
     def __len__(self):
         return len(self.image_paths)
-    
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         img = Image.open(img_path).convert("L")  # grayscale
@@ -47,166 +53,184 @@ class MRIDataset(Dataset):
             img = self.transform(img)
         return img
 
-# vae class
+# -- VAE MODEL --
 class VAE(nn.Module):
-    def __init__(self, input_channels, latent_dim, img_size):
+    def __init__(self, latent_dim, img_size):
         super(VAE, self).__init__()
-        self.img_size = img_size
 
-        # encoder
+        # encode
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),
             nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
             nn.Flatten()
         )
-
-        # flattened size after encoding
-        dummy_input = torch.zeros(1, input_channels, img_size, img_size)
-        conv_output_size = self.encoder(dummy_input).shape[1]
-
-        self.fc_mu = nn.Linear(conv_output_size, latent_dim)
-        self.fc_logvar = nn.Linear(conv_output_size, latent_dim)
-
-        # decoder
-        self.decoder_input = nn.Linear(latent_dim, conv_output_size)
+        self.fc_mu = nn.Linear(128 * (img_size // 8) * (img_size // 8), latent_dim)
+        self.fc_logvar = nn.Linear(128 * (img_size // 8) * (img_size // 8), latent_dim)
+        
+        # decode
+        self.decoder_input = nn.Linear(latent_dim, 128 * (img_size // 8) * (img_size // 8))
         self.decoder = nn.Sequential(
-            nn.Unflatten(1, (128, img_size // 8, img_size // 8)),
             nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
             nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(16, input_channels, 3, 1, 1), nn.Tanh()
+            nn.ConvTranspose2d(32, 1, 4, 2, 1), nn.Tanh()
         )
+        
+    def encode(self, x):
+        x = self.encoder(x)
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
 
-
-    def reparametrize(self, mu, logvar):
+    def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def decode(self, z, img_size):
+        z = self.decoder_input(z).view(-1, 128, img_size // 8, img_size // 8) # 
+        return self.decoder(z)
+
     def forward(self, x):
-        encoded = self.encoder(x)
-        mu, logvar = self.fc_mu(encoded), self.fc_logvar(encoded)
-        z = self.reparametrize(mu, logvar)
-        decoded = self.decoder(self.decoder_input(z))
-        return decoded, mu, logvar
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z, img_size), mu, logvar
 
-# calculate vae loss
-def vae_loss(recon_x, x, mu, logvar, beta=1):
+# loss function
+def vae_loss(recon_x, x, mu, logvar, beta=0.1): # beta allows us to control ratio between recon loss and kl divergence
     recon_loss = nn.MSELoss()(recon_x, x)
-    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return recon_loss + beta * kl_div / x.size(0)
+    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+    return recon_loss + beta * kl_div
 
-# train vae
-def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, limit=None):
-
-    epochs_str = ""
-    
+# train 
+def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, limit=None, learning_rate=1e-3, beta = 0.1):
+    print(f"Params: \nImg size: {img_size}\nBatch size: {batch_size}\nEpochs: {epochs}\nLatent dim: {latent_dim}\nLimit: {limit}\nLearning Rate: {learning_rate}")
+   
+    # transform for preprocessing
     transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
         transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
+        transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1]
     ])
-
-    # set data and convert to loaders
+    
     dataset = MRIDataset(root_dir=root_dir, transform=transform, limit=limit)
+
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # initialize
+    vae = VAE(latent_dim=latent_dim, img_size=img_size).to(device)
+    optimizer = optim.Adam(vae.parameters(), lr=learning_rate, weight_decay=1e-5)
 
-    vae = VAE(input_channels=1, latent_dim=latent_dim, img_size=img_size).to(device)
-    optimizer = optim.Adam(vae.parameters(), lr=1e-3)
-
-    # train loop
+    # -- TRAIN LOOP --
     train_losses, val_losses = [], []
     for epoch in range(epochs):
-        print("running epoch %d" % epoch)
         vae.train()
         train_loss = 0
-        batch_ctr = 0
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
             recon_batch, mu, logvar = vae(batch)
-            loss = vae_loss(recon_batch, batch, mu, logvar)
+
+            loss = vae_loss(recon_batch, batch, mu, logvar, beta=beta)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-            print(f"     ran batch {batch_ctr}")
-            batch_ctr += 1
-        train_losses.append(train_loss / len(train_loader))
 
-        # val loss
+            train_loss += loss.item()
+
+        train_losses.append(train_loss / len(train_loader))
+        
         vae.eval()
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
                 recon_batch, mu, logvar = vae(batch)
+
                 loss = vae_loss(recon_batch, batch, mu, logvar)
                 val_loss += loss.item()
+
         val_losses.append(val_loss / len(val_loader))
 
-        print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}\n")
-        epochs_str += f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}\n"
+        print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}")
 
-
-    # training curves
+    # -- PLOT TRAINING CURVES --
     plt.plot(train_losses, label="Train Loss")
     plt.plot(val_losses, label="Validation Loss")
     plt.legend()
-    curve_plot_path = os.path.join(run_dir, "curve_plot.png")
-    plt.savefig(curve_plot_path)
-    plt.show()
-    plt.close()
-    
-    vae.eval()
-    sample_batch = next(iter(val_loader)).to(device)
-    with torch.no_grad():
-        recon_batch, _, _ = vae(sample_batch)
-
-    # visualize reconstructions
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-    target_transform = Resize((img_size, img_size))
-
-    for i in range(5):
-        # show original image
-        original_image = target_transform(to_pil_image(sample_batch[i].cpu().squeeze()))
-        axes[0, i].imshow(original_image, cmap="gray")
-        axes[0, i].set_title("Original")
-        #axes[0, i].axis("off")
-
-        # show reconstructed image
-        axes[1, i].imshow(recon_batch[i].cpu().squeeze(), cmap="gray")
-        axes[1, i].set_title("Reconstructed")
-        #axes[1, i].axis("off")
-
-    loss_plot_path = os.path.join(run_dir, "loss_curve.png")
-    plt.savefig(loss_plot_path)
+    plt.savefig(os.path.join(run_dir, "training_curve.png"))
     plt.show()
     plt.clf()
-    plt.close()
 
-    model_save_path = os.path.join(run_dir, "vae_model.pth")
-    torch.save(vae.state_dict(), model_save_path)
+    torch.save(vae.state_dict(), os.path.join(run_dir,"vae_model.pth"))
 
-    metadata_path = os.path.join(run_dir, "metadata.txt")
-    with open(metadata_path, "w") as f:
-        f.write(f"Run Timestamp: {timestamp}\n")
-        f.write(f"Latent Dimensions: {latent_dim}\n")
-        f.write(f"Learning Rate: {optimizer.defaults['lr']}\n")
-        f.write(f"Epochs: {len(train_losses)}\n")
-        f.write(f"Model Output: {epochs_str}")
-        f.write(f"Trained on {limit} images")
+    # visualization from random latent points - check how good the latent space is 
+    vae.eval()
+    num_samples = 16
+    with torch.no_grad():
+        points = torch.randn(num_samples, latent_dim).to(device)
+        generated_images = vae.decode(points, img_size).cpu()
 
-# Run training
-print("Training")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_vae(root_dir="Data", img_size=256, epochs=200, latent_dim=256, limit=500)
-print("Finished training")
+    fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(generated_images[i].squeeze(), cmap="gray")
+        ax.axis("off")
+    plt.savefig(os.path.join(run_dir, "gen_img.png"))
+    plt.show()
+    plt.clf()
 
+
+    print(f"Val loss: {val_losses[-1]}")
+
+    return train_losses[-1], val_losses[-1]
+
+# optimize hyperparameters with optuna 
+def objective(trial): 
+    latent_dim = trial.suggest_int("latent_dim", 32, img_size) 
+    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2)
+    beta = trial.suggest_float("beta", 0.1, 4.0)
+
+    vae = VAE(latent_dim=latent_dim, img_size=img_size).to(device)
+    optimizer = optim.Adam(vae.parameters(), lr=learning_rate)
+
+    train_loss, val_loss = train_vae("Data", img_size=img_size, epochs=50, latent_dim=latent_dim, learning_rate=learning_rate, beta=beta, limit=100)
+    print(f"Completed trial!")
+    return val_loss
+
+pruner = optuna.pruners.MedianPruner()
+study = optuna.create_study(direction='minimize', pruner=pruner)
+study.optimize(objective, n_trials=100)
+
+print(f"Best hyperparameters: {study.best_params}")
+
+optuna.visualization.matplotlib.plot_optimization_history(study)
+plt.tight_layout()
+plt.savefig(os.path.join(run_dir, "optimization_history.png"))
+plt.clf()
+
+optuna.visualization.matplotlib.plot_param_importances(study)
+plt.tight_layout()
+plt.savefig(os.path.join(run_dir, "param_importances.png"))
+plt.clf()
+
+optuna.visualization.matplotlib.plot_parallel_coordinate(study)
+plt.tight_layout()
+plt.savefig(os.path.join(run_dir, "parallel_coords.png"))
+plt.clf()
+
+optuna.visualization.matplotlib.plot_timeline(study)
+plt.tight_layout()
+plt.savefig(os.path.join(run_dir, "plot_timeline.png"))
+plt.clf()
+
+
+# Usage
+#root_dir = "Data"  # Replace with the actual path
+#train_vae(root_dir, img_size=img_size, batch_size=16, epochs=10, latent_dim=128, learning_rate=1e-3, limit=100)
+
+# restore prints 
+sys.stdout = sys.__stdout__
