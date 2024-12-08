@@ -10,16 +10,37 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from datetime import datetime
 import optuna
+import subprocess
 
 seed = 0
 torch.manual_seed(0)
 
-print("In VAE, running! ")
+print("In VAE, running!")
+
+# have prints output to both file and console (for Turing)
+class DualOut: 
+    def __init__(self, filepath):
+        self.terminal = sys.stdout  # Capture the terminal output
+        self.logfile = open(filepath, "w")  # Open the output file to write
+        self.errorfile = open(filepath.replace("output.txt", "error.txt"), "w")  # Capture error logs
+
+    def write(self, message):
+        self.terminal.write(message)  # Print to terminal
+        self.logfile.write(message)  # Write to output file
+        if message.startswith('Traceback'):  # If it's an error message, also log to error file
+            self.errorfile.write(message)
+
+    def flush(self):
+        self.terminal.flush()  # Ensure terminal output is flushed
+        self.logfile.flush()  # Ensure log file output is flushed
+        self.errorfile.flush()  # Ensure error log is flushed
 
 # timestamped folders for run results
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 run_dir = os.path.join("vae_runs", timestamp)
 os.makedirs(run_dir, exist_ok=True)
+
+sys.stdout = DualOut(os.path.join(run_dir,"output.txt"))
 
 # -- SET DEVICE --
 if torch.cuda.is_available(): 
@@ -27,9 +48,6 @@ if torch.cuda.is_available():
     print("Using GPU!!!")
 else: 
     device = "cpu"
-
-img_size = 400
-sys.stdout = open(os.path.join(run_dir, "output.txt"), "w") # redirect prints to file if running in Turing
 
 # -- DEFINE MRI DATA --
 class MRIDataset(Dataset):
@@ -57,14 +75,19 @@ class MRIDataset(Dataset):
 class VAE(nn.Module):
     def __init__(self, latent_dim, img_size):
         super(VAE, self).__init__()
+        img_size=img_size
 
         # encode
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(),
+            SelfAttention(32),
             nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),
+            SelfAttention(64),
             nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
+            SelfAttention(128),
             nn.Flatten()
         )
+        
         self.fc_mu = nn.Linear(128 * (img_size // 8) * (img_size // 8), latent_dim)
         self.fc_logvar = nn.Linear(128 * (img_size // 8) * (img_size // 8), latent_dim)
         
@@ -91,20 +114,43 @@ class VAE(nn.Module):
         z = self.decoder_input(z).view(-1, 128, img_size // 8, img_size // 8) # 
         return self.decoder(z)
 
-    def forward(self, x):
+    def forward(self, x, img_size):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         return self.decode(z, img_size), mu, logvar
+    
+# -- SELF-ATTENTION LAYERS -- 
+class SelfAttention(nn.Module):
+    def __init__(self, channels):
+        super(SelfAttention, self).__init__()
+        self.query = nn.Conv2d(channels, channels//8, 1)
+        self.key = nn.Conv2d(channels, channels//8, 1)
+        self.value = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+    
+    def forward(self, x): 
+        batch_size, C, H, W = x.size()
 
-# loss function
+        query = self.query(x).view(batch_size, -1, H*W).permute(0, 2, 1)
+        key = self.key(x).view(batch_size, -1, H*W)
+        attention=torch.softmax(torch.bmm(query,key), dim=-1) 
+        value = self.value(x).view(batch_size, -1, H*W) 
+
+        out=torch.bmm(value, attention.permute(0, 2, 1)).view(batch_size, C, H, W)
+        out = self.gamma * out + x
+        return out
+
+
+# -- LOSS FUNCTION --
 def vae_loss(recon_x, x, mu, logvar, beta=0.1): # beta allows us to control ratio between recon loss and kl divergence
     recon_loss = nn.MSELoss()(recon_x, x)
+    logvar = torch.clamp(logvar, min=-10, max=10)  # Clamp logvar
     kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
     return recon_loss + beta * kl_div
 
-# train 
-def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, limit=None, learning_rate=1e-3, beta = 0.1):
-    print(f"Params: \nImg size: {img_size}\nBatch size: {batch_size}\nEpochs: {epochs}\nLatent dim: {latent_dim}\nLimit: {limit}\nLearning Rate: {learning_rate}")
+# -- TRAIN -- 
+def train_vae(img_size=128, batch_size=16, epochs=50, latent_dim=128, limit=None, learning_rate=1e-3, beta = 0.1):
+    print(f"Params: \nImg size: {img_size}\nBatch size: {batch_size}\nEpochs: {epochs}\nLatent dim: {latent_dim}\nLimit: {limit}\nLearning Rate: {learning_rate}\nBeta: {beta}")
    
     # transform for preprocessing
     transform = transforms.Compose([
@@ -113,7 +159,7 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
         transforms.Normalize([0.5], [0.5])  # Normalize to [-1, 1]
     ])
     
-    dataset = MRIDataset(root_dir=root_dir, transform=transform, limit=limit)
+    dataset = MRIDataset("Data", transform=transform, limit=limit)
 
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -126,6 +172,8 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
     vae = VAE(latent_dim=latent_dim, img_size=img_size).to(device)
     optimizer = optim.Adam(vae.parameters(), lr=learning_rate, weight_decay=1e-5)
 
+    os.makedirs('generated_images', exist_ok=True)
+
     # -- TRAIN LOOP --
     train_losses, val_losses = [], []
     for epoch in range(epochs):
@@ -134,7 +182,7 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            recon_batch, mu, logvar = vae(batch)
+            recon_batch, mu, logvar = vae(batch, img_size=img_size)
 
             loss = vae_loss(recon_batch, batch, mu, logvar, beta=beta)
             loss.backward()
@@ -149,7 +197,7 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                recon_batch, mu, logvar = vae(batch)
+                recon_batch, mu, logvar = vae(batch, img_size=img_size)
 
                 loss = vae_loss(recon_batch, batch, mu, logvar)
                 val_loss += loss.item()
@@ -158,7 +206,7 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
 
         print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}")
 
-    # -- PLOT TRAINING CURVES --
+    # plot training curves
     plt.plot(train_losses, label="Train Loss")
     plt.plot(val_losses, label="Validation Loss")
     plt.legend()
@@ -179,58 +227,67 @@ def train_vae(root_dir, img_size=128, batch_size=16, epochs=50, latent_dim=128, 
     for i, ax in enumerate(axes.flat):
         ax.imshow(generated_images[i].squeeze(), cmap="gray")
         ax.axis("off")
-    plt.savefig(os.path.join(run_dir, "gen_img.png"))
+    plt.savefig(os.path.join(run_dir, f"gen_img_{timestamp}.png"))
     plt.show()
     plt.clf()
 
+    print(f"mu mean: {mu.mean()}, logvar mean: {logvar.mean()}")
 
     print(f"Val loss: {val_losses[-1]}")
 
     return train_losses[-1], val_losses[-1]
 
 # optimize hyperparameters with optuna 
-def objective(trial): 
-    latent_dim = trial.suggest_int("latent_dim", 32, img_size) 
-    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2)
-    beta = trial.suggest_float("beta", 0.1, 4.0)
 
-    vae = VAE(latent_dim=latent_dim, img_size=img_size).to(device)
-    optimizer = optim.Adam(vae.parameters(), lr=learning_rate)
+def optimize_hyperparams(img_size=128, epochs=25, limit=100, n_trials=100):
+    def objective(trial): 
+        latent_dim = trial.suggest_int("latent_dim", 32, img_size) 
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3)
+        beta = trial.suggest_float("beta", 0.1, 4.0)
 
-    train_loss, val_loss = train_vae("Data", img_size=img_size, epochs=50, latent_dim=latent_dim, learning_rate=learning_rate, beta=beta, limit=100)
-    print(f"Completed trial!")
-    return val_loss
+        vae = VAE(latent_dim=latent_dim, img_size=img_size).to(device)
+        optimizer = optim.Adam(vae.parameters(), lr=learning_rate)
 
-pruner = optuna.pruners.MedianPruner()
-study = optuna.create_study(direction='minimize', pruner=pruner)
-study.optimize(objective, n_trials=100)
+        train_loss, val_loss = train_vae(img_size=img_size, epochs=epochs, latent_dim=latent_dim, learning_rate=learning_rate, beta=beta, limit=limit)
+        print(f"Completed trial!")
+        return val_loss
 
-print(f"Best hyperparameters: {study.best_params}")
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
 
-optuna.visualization.matplotlib.plot_optimization_history(study)
-plt.tight_layout()
-plt.savefig(os.path.join(run_dir, "optimization_history.png"))
-plt.clf()
+    print(f"Best hyperparameters: {study.best_params}")
 
-optuna.visualization.matplotlib.plot_param_importances(study)
-plt.tight_layout()
-plt.savefig(os.path.join(run_dir, "param_importances.png"))
-plt.clf()
+    optuna.visualization.matplotlib.plot_optimization_history(study)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "optimization_history.png"))
+    plt.clf()
 
-optuna.visualization.matplotlib.plot_parallel_coordinate(study)
-plt.tight_layout()
-plt.savefig(os.path.join(run_dir, "parallel_coords.png"))
-plt.clf()
+    optuna.visualization.matplotlib.plot_param_importances(study)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "param_importances.png"))
+    plt.clf()
 
-optuna.visualization.matplotlib.plot_timeline(study)
-plt.tight_layout()
-plt.savefig(os.path.join(run_dir, "plot_timeline.png"))
-plt.clf()
+    optuna.visualization.matplotlib.plot_parallel_coordinate(study)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "parallel_coords.png"))
+    plt.clf()
 
+    optuna.visualization.matplotlib.plot_timeline(study)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "plot_timeline.png"))
+    plt.clf()
 
-# Usage
-#root_dir = "Data"  # Replace with the actual path
-#train_vae(root_dir, img_size=img_size, batch_size=16, epochs=10, latent_dim=128, learning_rate=1e-3, limit=100)
+    return study.best_params, study.best_value
+
+best_params, best_value = optimize_hyperparams(
+    img_size=128,
+    epochs=30,
+    limit=100, 
+    n_trials=10
+)
+
+print("Completed VAE")
+print(f"Best parameters: {best_params}\n Best value: {best_value}\n")
 
 # restore prints 
 sys.stdout = sys.__stdout__
